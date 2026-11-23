@@ -1,7 +1,7 @@
 """Crea y sube un Short de curiosidades a YouTube, todo con herramientas gratuitas.
 
 Flujo: tema (Gemini gratis o banco de datos propio) -> voz (edge-tts) ->
-fondos (Pexels) -> montaje con subtitulos (ffmpeg) -> subida (YouTube Data API).
+fondos (Pixabay) -> montaje con subtitulos (ffmpeg) -> subida (YouTube Data API).
 """
 import asyncio
 import json
@@ -128,44 +128,53 @@ def make_srt(text, duration, words_per_chunk=4):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------- Pexels
-def _pexels_get(path, params):
-    headers = {"Authorization": os.environ["PEXELS_API_KEY"]}
-    for base in ("https://api.pexels.com/v1/videos", "https://api.pexels.com/videos"):
-        r = requests.get(f"{base}/{path}", headers=headers, params=params, timeout=30)
-        if r.status_code == 200:
-            return r.json()
+# --------------------------------------------------------------------- Pixabay
+def video_api_key():
+    # Se acepta PIXABAY_API_KEY, o PEXELS_API_KEY por si la clave se guardo con ese nombre.
+    key = os.environ.get("PIXABAY_API_KEY") or os.environ.get("PEXELS_API_KEY")
+    if not key:
+        raise SystemExit("Falta la clave de Pixabay (secreto PIXABAY_API_KEY).")
+    return key
+
+
+def pixabay_search(term):
+    r = requests.get(
+        "https://pixabay.com/api/videos/",
+        params={"key": video_api_key(), "q": term[:100], "per_page": 20, "safesearch": "true"},
+        timeout=30,
+    )
     r.raise_for_status()
+    return r.json().get("hits", [])
 
 
-def pick_file(video):
-    files = [f for f in video["video_files"] if f.get("file_type") == "video/mp4" and f.get("width")]
-    good = [f for f in files if f["width"] >= 720 and f["height"] >= 1280]
-    pool = good or files
-    return min(pool, key=lambda f: f["width"]) if pool else None
+def pick_url(hit):
+    for size in ("large", "medium", "small"):
+        v = hit.get("videos", {}).get(size) or {}
+        if v.get("url"):
+            return v["url"]
+    return None
 
 
 def fetch_clips(keywords, needed_seconds):
     clips, seen, total = [], set(), 0.0
     queries = list(keywords) + ["nature", "abstract light"]
     for kw in queries:
-        data = _pexels_get("search", {"query": kw, "orientation": "portrait", "per_page": 15})
-        videos = data.get("videos", [])
-        random.shuffle(videos)
-        for v in videos:
-            if v["id"] in seen or v.get("duration", 0) < 4:
+        hits = pixabay_search(kw)
+        random.shuffle(hits)
+        for h in hits:
+            if h["id"] in seen or h.get("duration", 0) < 4:
                 continue
-            f = pick_file(v)
-            if not f:
+            url = pick_url(h)
+            if not url:
                 continue
-            seen.add(v["id"])
-            clips.append(f["link"])
-            total += min(v["duration"], 9)
+            seen.add(h["id"])
+            clips.append(url)
+            total += min(h["duration"], 9)
             break
         if total >= needed_seconds and len(clips) >= 3:
             break
     if len(clips) < 2:
-        raise SystemExit("No se encontraron suficientes videos de fondo en Pexels.")
+        raise SystemExit("No se encontraron suficientes videos de fondo en Pixabay.")
     return clips
 
 
@@ -189,7 +198,7 @@ def build_video(clip_paths, audio_path, srt_path, out_path, duration):
         part = WORK / f"part{i}.mp4"
         run([
             "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(cp), "-t", f"{seg:.3f}", "-an",
-            "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,setsar=1",
+            "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30,setsar=1",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p", str(part),
         ])
         parts.append(part)
@@ -227,7 +236,7 @@ def upload(video_path, data):
     title = data["title"][:100]
     if "#shorts" not in title.lower():
         title = (title[:90] + " #Shorts").strip()
-    description = data["description"].rstrip() + "\n\nVideos de fondo: Pexels (pexels.com)."
+    description = data["description"].rstrip() + "\n\nVideos de fondo: Pixabay (pixabay.com)."
     body = {
         "snippet": {
             "title": title,
