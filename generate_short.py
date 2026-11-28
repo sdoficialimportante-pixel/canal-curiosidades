@@ -21,7 +21,16 @@ BANK_FILE = ROOT / "facts_bank.json"
 
 VOICE = os.getenv("TTS_VOICE", "es-ES-AlvaroNeural")
 PRIVACY = os.getenv("PRIVACY_STATUS", "public")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Se prueban en orden hasta que uno funcione (Google retira modelos con el tiempo).
+GEMINI_MODELS = [m for m in [
+    os.getenv("GEMINI_MODEL"),
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+] if m]
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 
@@ -53,29 +62,35 @@ def gemini_script(used):
         '"narration" (texto de voz en off en espanol, 75 a 100 palabras: gancho inicial, el dato, un giro sorprendente y cierre), '
         '"keywords" (lista de 4 busquedas en INGLES para encontrar videos de fondo, por ejemplo "ocean waves").'
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    try:
-        r = requests.post(
-            url,
-            params={"key": key},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
-            },
-            timeout=90,
-        )
-        r.raise_for_status()
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        data = json.loads(text)
-        for k in ("topic", "title", "description", "tags", "narration", "keywords"):
-            if k not in data:
-                raise ValueError(f"falta la clave {k}")
-        if data["topic"] in used:
-            return None
-        return data
-    except Exception as exc:  # si Gemini falla usamos el banco de datos
-        log(f"Gemini no disponible ({exc}); se usa el banco de datos.")
-        return None
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url,
+                params={"key": key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
+                },
+                timeout=90,
+            )
+            if r.status_code != 200:
+                log(f"Gemini {model}: error {r.status_code} {r.text[:150]!r}")
+                continue
+            text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = json.loads(text)
+            for k in ("topic", "title", "description", "tags", "narration", "keywords"):
+                if k not in data:
+                    raise ValueError(f"falta la clave {k}")
+            if data["topic"] in used:
+                log(f"Gemini {model}: repitio un tema, se prueba otro modelo.")
+                continue
+            log(f"Guion creado con {model}.")
+            return data
+        except Exception as exc:
+            log(f"Gemini {model}: fallo ({type(exc).__name__}: {exc})")
+    log("Gemini no disponible con ningun modelo; se usa el banco de datos.")
+    return None
 
 
 def bank_script(used):
