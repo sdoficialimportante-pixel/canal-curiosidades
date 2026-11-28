@@ -53,6 +53,7 @@ def gemini_script(used):
         "Eres guionista de un canal de YouTube Shorts en espanol de curiosidades. "
         "Elige UN dato curioso real, verificable y poco conocido (ciencia, historia, cuerpo humano, "
         "espacio, animales o historia de objetos cotidianos). No inventes nada. "
+        "Evita mitos populares, leyendas y datos que los expertos discuten: solo hechos bien documentados por fuentes cientificas o historicas fiables. "
         "No repitas estos temas ya publicados: " + (" | ".join(used) or "ninguno") + ". "
         "Responde SOLO con JSON con estas claves: "
         '"topic" (el dato en una frase), '
@@ -93,12 +94,76 @@ def gemini_script(used):
     return None
 
 
+def _parse_json_text(text):
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise ValueError("sin JSON en la respuesta")
+    return json.loads(m.group(0))
+
+
+def verify_script(data):
+    """Pide a Gemini (con busqueda en Google) que compruebe el dato.
+    Devuelve True (verificado), False (dudoso o falso) o None (no se pudo comprobar)."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        return None
+    prompt = (
+        "Eres un verificador de datos riguroso. Comprueba el siguiente texto de un video de curiosidades "
+        "buscando en la web fuentes fiables (universidades, museos, agencias cientificas, enciclopedias, medios reputados).\n\n"
+        f"TEMA: {data['topic']}\nTEXTO: {data['narration']}\n\n"
+        "Revisa TODAS las afirmaciones, incluidos numeros, fechas y comparaciones. "
+        "Responde SOLO con un JSON: {\"veredicto\": \"verdadero\" | \"dudoso\" | \"falso\", \"motivo\": \"una frase\"}. "
+        "Usa \"verdadero\" unicamente si todas las afirmaciones estan respaldadas por fuentes fiables y no son un mito, "
+        "una leyenda ni un dato discutido. Ante la duda, responde \"dudoso\"."
+    )
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url,
+                params={"key": key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "tools": [{"google_search": {}}],
+                    "generationConfig": {"temperature": 0.0},
+                },
+                timeout=120,
+            )
+            if r.status_code != 200:
+                log(f"Verificador {model}: error {r.status_code} {r.text[:150]!r}")
+                continue
+            parts = r.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts)
+            res = _parse_json_text(text)
+            verdict = str(res.get("veredicto", "")).strip().lower()
+            log(f"Verificacion ({model}): {verdict} - {res.get('motivo', '')}")
+            return verdict == "verdadero"
+        except Exception as exc:
+            log(f"Verificador {model}: fallo ({type(exc).__name__}: {exc})")
+    return None
+
+
 def bank_script(used):
     bank = json.loads(BANK_FILE.read_text(encoding="utf-8"))
     pending = [f for f in bank if f["topic"] not in used]
-    if not pending:
-        raise SystemExit("No quedan temas en facts_bank.json. Anade mas o configura GEMINI_API_KEY.")
-    return pending[0]
+    return pending[0] if pending else None
+
+
+def choose_script(used):
+    """Gemini propone, Gemini verifica. Si no hay un dato verificado, se usa el banco
+    (datos revisados a mano) y, si tampoco queda nada, no se publica."""
+    rejected = []
+    for attempt in range(1, 6):
+        data = gemini_script(used + rejected)
+        if not data:
+            break
+        ok = verify_script(data)
+        if ok:
+            return data
+        log(f"Intento {attempt}: dato descartado ({'dudoso' if ok is False else 'sin verificar'}): {data['topic']}")
+        rejected.append(data["topic"])
+    log("Se usa el banco de datos revisados.")
+    return bank_script(used)
 
 
 # ----------------------------------------------------------------------- voz
@@ -275,7 +340,10 @@ def upload(video_path, data):
 def main():
     WORK.mkdir(exist_ok=True)
     used = load_used()
-    data = gemini_script(used) or bank_script(used)
+    data = choose_script(used)
+    if not data:
+        log("No hay ningun dato verificado disponible hoy: no se publica nada (mejor ningun video que uno dudoso).")
+        return
     log(f"Tema: {data['topic']}")
 
     voice_path = WORK / "voz.mp3"
