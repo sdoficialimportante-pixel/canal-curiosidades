@@ -11,6 +11,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 
 import requests
 
@@ -101,45 +102,75 @@ def _parse_json_text(text):
     return json.loads(m.group(0))
 
 
+_GROUNDING_OK = True  # pasa a False si la busqueda de Google no esta disponible en tu cuenta gratuita
+
+
+def _verdict_call(model, prompt, grounded):
+    """Devuelve (estado_http, veredicto o None)."""
+    key = os.environ["GEMINI_API_KEY"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.0}}
+    if grounded:
+        body["tools"] = [{"google_search": {}}]
+    r = requests.post(url, params={"key": key}, json=body, timeout=120)
+    if r.status_code != 200:
+        log(f"Verificador {model} ({'con busqueda' if grounded else 'sin busqueda'}): error {r.status_code}")
+        return r.status_code, None
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    res = _parse_json_text("".join(p.get("text", "") for p in parts))
+    verdict = str(res.get("veredicto", "")).strip().lower()
+    log(f"Verificacion {model} ({'con busqueda' if grounded else 'sin busqueda'}): {verdict} - {res.get('motivo', '')}")
+    return 200, verdict
+
+
 def verify_script(data):
-    """Pide a Gemini (con busqueda en Google) que compruebe el dato.
+    """Comprueba el dato antes de publicarlo.
+    1) Con busqueda en Google, si tu cuenta gratuita lo permite.
+    2) Si no, con DOS modelos distintos que deben coincidir en 'verdadero'.
     Devuelve True (verificado), False (dudoso o falso) o None (no se pudo comprobar)."""
-    key = os.getenv("GEMINI_API_KEY")
-    if not key:
+    global _GROUNDING_OK
+    if not os.getenv("GEMINI_API_KEY"):
         return None
-    prompt = (
-        "Eres un verificador de datos riguroso. Comprueba el siguiente texto de un video de curiosidades "
-        "buscando en la web fuentes fiables (universidades, museos, agencias cientificas, enciclopedias, medios reputados).\n\n"
+    base = (
+        "Eres un verificador de datos riguroso para un canal de curiosidades.\n\n"
         f"TEMA: {data['topic']}\nTEXTO: {data['narration']}\n\n"
-        "Revisa TODAS las afirmaciones, incluidos numeros, fechas y comparaciones. "
+        "Revisa TODAS las afirmaciones, incluidos numeros, fechas, diferencias de tiempo y comparaciones: "
+        "haz las cuentas tu mismo. "
         "Responde SOLO con un JSON: {\"veredicto\": \"verdadero\" | \"dudoso\" | \"falso\", \"motivo\": \"una frase\"}. "
-        "Usa \"verdadero\" unicamente si todas las afirmaciones estan respaldadas por fuentes fiables y no son un mito, "
-        "una leyenda ni un dato discutido. Ante la duda, responde \"dudoso\"."
+        "Usa \"verdadero\" unicamente si estas seguro de que TODO es correcto y bien documentado, y no es un mito, "
+        "una leyenda ni un dato discutido. Ante la minima duda, responde \"dudoso\"."
     )
-    for model in GEMINI_MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        try:
-            r = requests.post(
-                url,
-                params={"key": key},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "tools": [{"google_search": {}}],
-                    "generationConfig": {"temperature": 0.0},
-                },
-                timeout=120,
-            )
-            if r.status_code != 200:
-                log(f"Verificador {model}: error {r.status_code} {r.text[:150]!r}")
+    # 1) con busqueda en Google
+    if _GROUNDING_OK:
+        for model in GEMINI_MODELS:
+            try:
+                status, verdict = _verdict_call(model, base + " Busca antes en fuentes fiables de la web.", True)
+            except Exception as exc:
+                log(f"Verificador {model}: fallo ({type(exc).__name__}: {exc})")
                 continue
-            parts = r.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts)
-            res = _parse_json_text(text)
-            verdict = str(res.get("veredicto", "")).strip().lower()
-            log(f"Verificacion ({model}): {verdict} - {res.get('motivo', '')}")
-            return verdict == "verdadero"
+            if status == 200:
+                return verdict == "verdadero"
+            if status == 429:
+                _GROUNDING_OK = False
+                log("La busqueda de Google no esta disponible hoy; se verifica sin busqueda con dos modelos.")
+                break
+    # 2) sin busqueda, con dos modelos distintos
+    verdicts = []
+    for model in GEMINI_MODELS:
+        if len(verdicts) == 2:
+            break
+        try:
+            time.sleep(3)
+            status, verdict = _verdict_call(model, base, False)
         except Exception as exc:
             log(f"Verificador {model}: fallo ({type(exc).__name__}: {exc})")
+            continue
+        if status == 200:
+            verdicts.append(verdict)
+            if verdict != "verdadero":
+                return False
+    if len(verdicts) == 2:
+        return all(v == "verdadero" for v in verdicts)
     return None
 
 
@@ -162,6 +193,7 @@ def choose_script(used):
             return data
         log(f"Intento {attempt}: dato descartado ({'dudoso' if ok is False else 'sin verificar'}): {data['topic']}")
         rejected.append(data["topic"])
+        time.sleep(5)
     log("Se usa el banco de datos revisados.")
     return bank_script(used)
 
